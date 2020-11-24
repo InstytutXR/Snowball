@@ -1,4 +1,4 @@
-﻿//#define DISABLE_CHANNEL_VARINT
+﻿#define DISABLE_CHANNEL_VARINT
 
 using System;
 using System.Collections.Generic;
@@ -9,21 +9,23 @@ using System.Timers;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Net.Sockets;
+using System.Linq;
+
+using System.Security.Cryptography;
 
 namespace Snowball
 {
-
-    public class ComServer : IDisposable
+    public sealed class ComServer : IDisposable
     {
-        public bool IsOpened { get; protected set; }
+        public bool IsOpened { get; private set; }
 
-        int listenPortNumber = 59901;
-        public int ListenPortNumber { get { return listenPortNumber; } set { if (!IsOpened)listenPortNumber = value; } }
+        int beaconPortNumber = 32000;
+        public int BeaconPortNumber { get { return beaconPortNumber; } set { if (!IsOpened) beaconPortNumber = value; } }
 
-        int sendPortNumber = 59902;
-        public int SendPortNumber { get { return sendPortNumber; } set { if (!IsOpened) sendPortNumber = value; } }
+        int portNumber = 32001;
+        public int PortNumber { get { return portNumber; } set { if (!IsOpened) portNumber = value; } }
 
-        int bufferSize = 8192;
+        int bufferSize = 81920;
         public int BufferSize { get { return bufferSize; } set { if (!IsOpened) bufferSize = value; } }
 
         public delegate void ConnectedHandler(ComNode node);
@@ -32,28 +34,47 @@ namespace Snowball
         public delegate void DisconnectedHandler(ComNode node);
         public DisconnectedHandler OnDisconnected;
 
-        protected Dictionary<short, IDataChannel> dataChannelMap = new Dictionary<short, IDataChannel>();
+        public delegate void NodeRemovedHandler(ComNode node);
+        public NodeRemovedHandler OnNodeRemoved;
 
-        protected Dictionary<string, ComNode> userNodeMap = new Dictionary<string, ComNode>();
-        protected Dictionary<IPEndPoint, ComNode> nodeTcpMap = new Dictionary<IPEndPoint, ComNode>();
-        protected Dictionary<IPEndPoint, ComNode> nodeUdpMap = new Dictionary<IPEndPoint, ComNode>();
+        bool isDisconnecting = false;
+
+        Dictionary<short, IDataChannel> dataChannelMap = new Dictionary<short, IDataChannel>();
+
+        Dictionary<int, ComNode> userNodeMap = new Dictionary<int, ComNode>();
+        ReaderWriterLock userNodeMapLock = new ReaderWriterLock();
+
+        Dictionary<IPEndPoint, ComNode> nodeTcpMap = new Dictionary<IPEndPoint, ComNode>();
+        Dictionary<IPEndPoint, ComNode> nodeUdpMap = new Dictionary<IPEndPoint, ComNode>();
+
+        Random userIdRandom = new Random();
+
+        Dictionary<int, ComNode> disconnectedUserNodeMap = new Dictionary<int, ComNode>();
+        ReaderWriterLock disconnectedUserNodeMapLock = new ReaderWriterLock();
 
         public delegate string BeaconDataGenerateFunc();
         BeaconDataGenerateFunc BeaconDataCreate = () => {
-            return "Snowball"; 
-            };
-
+            return "Snowball";
+        };
         public void SetBeaconDataCreateFunction(BeaconDataGenerateFunc func) { BeaconDataCreate = func; }
 
-        UDPSender udpSender;
-        UDPReceiver udpReceiver;
+        UDPTerminal udpBeaconSender;
+        UDPTerminal udpTerminal;
 
         TCPListener tcpListener;
 
-
-        protected int beaconIntervalMs = 1000;
+        int beaconIntervalMs = 1000;
         public int BeaconIntervalMs { get { return beaconIntervalMs; } set { if (!IsOpened) beaconIntervalMs = value; } }
         System.Timers.Timer beaconTimer;
+
+        int healthIntervalMs = 500;
+        System.Timers.Timer healthTimer;
+
+        int removeNodeCheckIntervalMs = 1000;
+        System.Timers.Timer removeNodeCheckTimer;
+
+        int removeIntervalSec = 30;
+        public int RemoveIntervalSec { get { return removeIntervalSec; } set { if (!IsOpened) removeIntervalSec = value; } }
 
         Converter beaconConverter;
 
@@ -62,39 +83,167 @@ namespace Snowball
 
         List<string> beaaconList = new List<string>();
 
-        public ComServer()
+        public RSAParameters RsaPrivateKey { get; private set; }
+        public RSAParameters RsaPublicKey { get; private set; }
+
+        RsaDecrypter rsaDecrypter;
+
+        public delegate void RsaKeyGenerateFunc(out RSAParameters publicKey, out RSAParameters privateKey);
+
+        RsaKeyGenerateFunc RsaKeyGenerate = (out RSAParameters publicKey, out RSAParameters privateKey) =>
+        {
+            RSACryptoServiceProvider rsa = new RSACryptoServiceProvider();
+            publicKey = rsa.ExportParameters(false);
+            privateKey = rsa.ExportParameters(true);
+        };
+        public void SetRsaKeyGenerateFunction(RsaKeyGenerateFunc func) { RsaKeyGenerate = func; }
+
+        bool userSyncContext;
+        SynchronizationContext syncContext;
+
+        public ComServer(bool userSyncContext = true)
         {
             IsOpened = false;
 
-			AddChannel(new DataChannel<string>((short)PreservedChannelId.Login, QosType.Reliable, Compression.None, (node, data) =>
+            this.userSyncContext = userSyncContext;
+
+            AddChannel(new DataChannel<IssueIdData>((short)PreservedChannelId.IssueId, QosType.Reliable, Compression.None, Encryption.None, (node, data) =>
             {
-                node.UserName = data;
-                
-                if (userNodeMap.ContainsKey(node.UserName)) { userNodeMap.Remove(node.UserName); }
-
-                userNodeMap.Add(node.UserName, node);
-                Util.Log("SetUsername:" + node.UserName);
-
+                OnIssueId(node, data);
             }));
 
-            AddChannel(new DataChannel<byte>((short)PreservedChannelId.Health, QosType.Unreliable, Compression.None, (node, data) =>
+            AddChannel(new DataChannel<byte[]>((short)PreservedChannelId.Health, QosType.Unreliable, Compression.None, Encryption.None, (node, data) =>
+            {
+                byte[] decrypted = DecrypteTmpKey(data);
+                if (node.TmpKey != null && node.TmpKey.SequenceEqual(decrypted)) node.HealthLostCount = 0;
+                else node.TmpKey = null;
+            }));
+
+            AddChannel(new DataChannel<IssueIdData>((short)PreservedChannelId.UdpNotify, QosType.Unreliable, Compression.None, Encryption.None, (node, data) =>
             {
             }));
 
-            AddChannel(new DataChannel<string>((short)PreservedChannelId.UdpNotify, QosType.Unreliable, Compression.None, (node, data) =>
+            AddChannel(new DataChannel<int>((short)PreservedChannelId.UdpNotifyAck, QosType.Reliable, Compression.None, Encryption.None, (node, data) =>
             {
             }));
 
-            AddChannel(new DataChannel<int>((short)PreservedChannelId.UdpNotifyAck, QosType.Reliable, Compression.None, (node, data) =>
+            AddChannel(new DataChannel<AesKeyPair>((short)PreservedChannelId.KeyExchange, QosType.Reliable, Compression.None, Encryption.Rsa, (node, data) =>
+            {
+                OnKeyExchange(node, data);
+            }));
+
+            AddChannel(new DataChannel<int>((short)PreservedChannelId.KeyExchangeAck, QosType.Reliable, Compression.None, Encryption.None, (node, data) =>
             {
             }));
 
             beaconConverter = DataSerializer.GetConverter(typeof(string));
+
+            healthTimer = new System.Timers.Timer(healthIntervalMs);
+            healthTimer.Elapsed += OnHealthCheck;
+
+            removeNodeCheckTimer = new System.Timers.Timer(removeNodeCheckIntervalMs);
+            removeNodeCheckTimer.Elapsed += OnRemoveNodeCheck;
+
         }
 
         public void Dispose()
         {
+            BeaconStop();
             Close();
+        }
+
+        void OnIssueId(ComNode node, IssueIdData data)
+        {
+            bool registerd = false;
+
+            if (data.Id != 0 && data.encryptionData != null && data.encryptionData.Length > 0)
+            {
+                ComNode previousNode = null;
+                try
+                {
+                    userNodeMapLock.AcquireReaderLock(1000);
+                    ComNode n;
+                    if (userNodeMap.TryGetValue(data.Id, out n)) previousNode = n;
+                }
+                finally
+                {
+                    userNodeMapLock.ReleaseReaderLock();
+                }
+
+                try
+                {
+                    disconnectedUserNodeMapLock.AcquireWriterLock(1000);
+                    ComNode n;
+                    if (previousNode == null && disconnectedUserNodeMap.TryGetValue(data.Id, out n))
+                    {
+                        previousNode = n;
+                        disconnectedUserNodeMap.Remove(data.Id);
+                    }
+                }
+                finally
+                {
+                    disconnectedUserNodeMapLock.ReleaseWriterLock();
+                }
+
+                if (previousNode != null && previousNode.AesDecrypter != null)
+                {
+                    try
+                    {
+                        byte[] decrypted = previousNode.AesDecrypter.Decrypt(data.encryptionData);
+                        if (decrypted.SequenceEqual(Global.ReconnectRawData))
+                        {
+                            node.UserId = previousNode.UserId;
+
+                            try
+                            {
+                                userNodeMapLock.AcquireWriterLock(1000);
+                                userNodeMap.Add(node.UserId, node);
+                            }
+                            finally
+                            {
+                                userNodeMapLock.ReleaseWriterLock();
+                            }
+                            registerd = true;
+                        }
+                    }
+                    catch
+                    {
+
+                    }
+                }
+
+            }
+
+            if (!registerd)
+            {
+                GenerateId(ref node);
+                registerd = true;
+            }
+
+            if (!registerd) Disconnect(node);
+            else
+            {
+                IssueIdData ldata = new IssueIdData();
+                ldata.Id = node.UserId;
+                string xml = rsaDecrypter.ToPublicKeyXmlString();
+                ldata.PublicKey = xml;
+                ldata.encryptionData = new byte[0];
+                SendInternal(node, (short)PreservedChannelId.IssueId, ldata);
+            }
+        }
+
+        void OnKeyExchange(ComNode node, AesKeyPair data)
+        {
+            var aes = Aes.Create();
+            aes.Padding = PaddingMode.PKCS7;
+            aes.Key = data.Key;
+            aes.IV = data.IV;
+
+            node.AesEncrypter = new AesEncrypter(aes);
+            node.AesDecrypter = new AesDecrypter(aes);
+
+            SendInternal(node, (short)PreservedChannelId.KeyExchangeAck, 0);
+
         }
 
         public void AddBeaconList(string ip)
@@ -107,33 +256,78 @@ namespace Snowball
             beaaconList.Remove(ip);
         }
 
+        void GenerateId(ref ComNode node)
+        {
+            int id;
+
+            while (true)
+            {
+                try
+                {
+                    userNodeMapLock.AcquireWriterLock(1000);
+                    disconnectedUserNodeMapLock.AcquireReaderLock(1000);
+
+                    id = userIdRandom.Next(1, int.MaxValue);
+
+                    if (!userNodeMap.ContainsKey(id) && !disconnectedUserNodeMap.ContainsKey(id))
+                    {
+                        userNodeMap.Add(id, node);
+                        node.UserId = id;
+                        break;
+                    }
+                }
+                finally
+                {
+                    disconnectedUserNodeMapLock.ReleaseReaderLock();
+                    userNodeMapLock.ReleaseWriterLock();
+                }
+
+            }
+
+        }
+
         public void Open()
         {
             if (IsOpened) return;
 
-            if (Global.UseSyncContextPost && Global.SyncContext == null)
-                Global.SyncContext = SynchronizationContext.Current;
+            if (userSyncContext) {
+                syncContext = SynchronizationContext.Current;
+                if(syncContext == null)
+                {
+                    syncContext = new SnowballSynchronizationContext(10);
+                    SynchronizationContext.SetSynchronizationContext(syncContext);
+                }
+            }
 
-            udpSender = new UDPSender(sendPortNumber, bufferSize);
-            udpReceiver = new UDPReceiver(listenPortNumber, bufferSize);
+            RSAParameters publicKey;
+            RSAParameters privateKey;
 
-            tcpListener = new TCPListener(listenPortNumber);
+            RsaKeyGenerate(out publicKey, out privateKey);
+            RsaPublicKey = publicKey;
+            RsaPrivateKey = privateKey;
+
+            rsaDecrypter = new RsaDecrypter(RsaPrivateKey);
+
+            udpTerminal = new UDPTerminal(portNumber, bufferSize);
+            udpTerminal.SyncContext = syncContext;
+            udpTerminal.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+
+            tcpListener = new TCPListener(portNumber);
+            tcpListener.SyncContext = syncContext;
             tcpListener.ConnectionBufferSize = bufferSize;
             tcpListener.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
             tcpListener.OnConnected += OnConnectedInternal;
 
-            beaconTimer = new System.Timers.Timer(BeaconIntervalMs);
-
-            udpReceiver.OnReceive += OnUDPReceived;
-
-            beaconTimer.Elapsed += OnBeaconTimer;
+            udpTerminal.OnReceive += OnUnreliableReceived;
 
             tcpListener.Start();
-            udpReceiver.Start();
+
+            udpTerminal.ReceiveStart();
 
             IsOpened = true;
 
-            HealthCheck();
+            healthTimer.Start();
+            removeNodeCheckTimer.Start();
         }
 
         int CreateBeaconData(out BytePacker packer)
@@ -163,17 +357,19 @@ namespace Snowball
             BytePacker packer;
             int length = CreateBeaconData(out packer);
 
-            udpSender.Send(ip, length, packer.Buffer);
+            udpBeaconSender.Send(ip, beaconPortNumber, length, packer.Buffer);
         }
 
         void OnBeaconTimer(object sender, ElapsedEventArgs args)
         {
+            if (!IsOpened) return;
+
             BytePacker packer;
             int length = CreateBeaconData(out packer);
 
             foreach (var ip in beaaconList)
             {
-                udpSender.Send(ip, length, packer.Buffer);
+                udpBeaconSender.Send(ip, beaconPortNumber, length, packer.Buffer);
             }
         }
 
@@ -181,7 +377,8 @@ namespace Snowball
         {
             if (!IsOpened) return;
 
-            beaconTimer.Stop();
+            healthTimer.Stop();
+            removeNodeCheckTimer.Stop();
 
             var nMap = new Dictionary<IPEndPoint, ComNode>(nodeTcpMap);
             foreach (var node in nMap)
@@ -190,57 +387,74 @@ namespace Snowball
             }
 
             tcpListener.Stop();
-            udpReceiver.Close();
-
-            beaconTimer = null;
+            udpTerminal.Close();
 
             tcpListener = null;
-            udpReceiver = null;
-            udpSender = null;
+            udpTerminal = null;
 
             IsOpened = false;
         }
 
         public void BeaconStart()
         {
-            beaconTimer.Start();
+            if (udpBeaconSender == null)
+            {
+                udpBeaconSender = new UDPTerminal(UDPTerminal.DefaultBufferSize);
+                udpBeaconSender.SyncContext = syncContext;
+                beaconTimer = new System.Timers.Timer(BeaconIntervalMs);
+                beaconTimer.Elapsed += OnBeaconTimer;
+                beaconTimer.Start();
+            }
         }
 
         public void BeaconStop()
         {
-            beaconTimer.Stop();
+            if (beaconTimer != null)
+            {
+                beaconTimer.Stop();
+                beaconTimer = null;
+                udpBeaconSender.Close();
+                udpBeaconSender = null;
+            }
         }
 
-        public ComNode GetTcpNodeByEndPoint(IPEndPoint endPoint)
+        public ComNode GetNodeByEndPoint(IPEndPoint endPoint)
         {
-            if (nodeTcpMap.ContainsKey(endPoint))
-            {
-                return nodeTcpMap[endPoint];
-            }
+            ComNode node;
+            if (nodeTcpMap.TryGetValue(endPoint, out node)) return node;
             return null;
         }
 
-        public ComNode GetUdpNodeByEndPoint(IPEndPoint endPoint)
+        byte[] GenerateTmpKey()
         {
-            if (nodeUdpMap.ContainsKey(endPoint))
-            {
-                return nodeUdpMap[endPoint];
-            }
-            return null;
+            Random rand = new Random();
+            byte[] key = new byte[4];
+            rand.NextBytes(key);
+            return key;
         }
 
-        public async Task HealthCheck()
+        byte[] DecrypteTmpKey(byte[] encrypted)
         {
-            while (IsOpened)
-            {
-                await Task.Delay(500);
+            return encrypted;
+        }
 
+        void OnHealthCheck(object sender, ElapsedEventArgs args)
+        {
+            if (!IsOpened) return;
+            HealthCheck();
+        }
+
+        async Task HealthCheck()
+        {
+            if (IsOpened)
+            {
                 List<ComNode> invalidNodeArray = new List<ComNode>();
 
-                byte dummy = 0;
-                foreach(var keypair in nodeTcpMap)
+                foreach (var keypair in nodeTcpMap)
                 {
-                    Send(keypair.Value, (short)PreservedChannelId.Health, dummy);
+                    byte[] key = GenerateTmpKey();
+                    keypair.Value.TmpKey = key;
+                    SendInternal(keypair.Value, (short)PreservedChannelId.Health, key);
                     keypair.Value.HealthLostCount++;
                     if (keypair.Value.HealthLostCount > MaxHealthLostCount)
                     {
@@ -250,11 +464,51 @@ namespace Snowball
 
                 foreach (var node in invalidNodeArray)
                 {
+                    //Util.Log("Server:Disconnect##########");
                     Disconnect(node);
                 }
             }
         }
 
+        void OnRemoveNodeCheck(object sender, ElapsedEventArgs args)
+        {
+            RemoveNodeCheck();
+        }
+        async Task RemoveNodeCheck()
+        {
+            TimeSpan intervalSpan = new TimeSpan(0, 0, RemoveIntervalSec);
+
+            List<int> removed = new List<int>();
+
+            foreach (var pair in disconnectedUserNodeMap)
+            {
+                TimeSpan elapsed = DateTime.Now - pair.Value.DisconnectedTimeStamp;
+
+                if (elapsed > intervalSpan)
+                {
+                    removed.Add(pair.Key);
+                }
+            }
+
+            foreach (var key in removed)
+            {
+                try
+                {
+                    disconnectedUserNodeMapLock.AcquireWriterLock(1000);
+
+                    ComNode node;
+                    if (disconnectedUserNodeMap.TryGetValue(key, out node))
+                    {
+                        disconnectedUserNodeMap.Remove(key);
+                        if (OnNodeRemoved != null) OnNodeRemoved(node);
+                    }
+                }
+                finally
+                {
+                    disconnectedUserNodeMapLock.ReleaseWriterLock();
+                }
+            }
+        }
 
         public void AddChannel(IDataChannel channel)
         {
@@ -268,25 +522,41 @@ namespace Snowball
 
         void OnConnectedInternal(TCPConnection connection)
         {
-			if (connection == null) return;
+            if (connection == null) return;
 
-			lock (this)
-			{
+            connection.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+
+            lock (this)
+            {
                 ComSnowballNode node = new ComSnowballNode(connection);
 
-				nodeTcpMap.Add(node.TcpEndPoint, node);
+                if (nodeTcpMap.ContainsKey(node.TcpEndPoint))
+                {
+                    Disconnect(node);
+                }
+                else
+                {
+                    nodeTcpMap.Add(node.TcpEndPoint, node);
 
-				connection.OnDisconnected = OnDisconnectedInternal;
-				connection.OnPoll = OnPoll;
-				Util.Log("Server:Connected");
-			}
+                    node.HealthLostCount = 0;
+
+                    connection.OnDisconnected = OnDisconnectedInternal;
+                    connection.OnPoll = OnPoll;
+                }
+
+                //Util.Log("Server:Connected");
+            }
         }
 
         public bool Disconnect(ComNode node)
         {
-            if (nodeTcpMap.ContainsKey(node.TcpEndPoint))
+            if (!node.IsDisconnecting && nodeTcpMap.ContainsKey(node.TcpEndPoint))
             {
-                ((ComSnowballNode)node).Connection.Disconnect();
+                node.IsDisconnecting = true;
+
+                ComSnowballNode snode = (ComSnowballNode)node;
+                snode.Connection.Disconnect();
+
                 return true;
             }
             else return false;
@@ -294,24 +564,53 @@ namespace Snowball
 
         void OnDisconnectedInternal(TCPConnection connection)
         {
-			lock (this)
-			{
-				if (nodeTcpMap.ContainsKey((IPEndPoint)connection.EndPoint))
-				{
-					ComNode node = nodeTcpMap[(IPEndPoint)connection.EndPoint];
-					nodeTcpMap.Remove((IPEndPoint)connection.EndPoint);
+            lock (this)
+            {
+                ComNode n;
 
-                    if(userNodeMap.ContainsKey(node.UserName)) userNodeMap.Remove(node.UserName);
-                    if (node.UdpEndPoint != null && nodeUdpMap.ContainsKey(node.UdpEndPoint)) nodeUdpMap.Remove(node.UdpEndPoint);
+                if (nodeTcpMap.TryGetValue((IPEndPoint)connection.EndPoint, out n))
+                {
+                    ComSnowballNode node = (ComSnowballNode)n;
+                    if (nodeTcpMap.ContainsKey(connection.EndPoint))
+                        nodeTcpMap.Remove((IPEndPoint)connection.EndPoint);
 
+                    try
+                    {
+                        userNodeMapLock.AcquireWriterLock(1000);
+                        if (userNodeMap.ContainsKey(node.UserId)) userNodeMap.Remove(node.UserId);
+                    }
+                    finally
+                    {
+                        userNodeMapLock.ReleaseWriterLock();
+                    }
+
+                    node.DisconnectedTimeStamp = DateTime.Now;
+
+                    try
+                    {
+                        disconnectedUserNodeMapLock.AcquireWriterLock(1000);
+
+                        if (!disconnectedUserNodeMap.ContainsKey(node.UserId))
+                            disconnectedUserNodeMap.Add(node.UserId, node);
+                    }
+                    finally
+                    {
+                        disconnectedUserNodeMapLock.ReleaseWriterLock();
+                    }
+
+                    if (node.UdpEndPoint != null && nodeUdpMap.ContainsKey(node.UdpEndPoint))
+                        nodeUdpMap.Remove(node.UdpEndPoint);
+
+                    node.UdpEndPoint = null;
+                    node.IsDisconnecting = false;
+
+                    node.IsConnected = false;
                     if (OnDisconnected != null) OnDisconnected(node);
-
-					Util.Log("Server:Disconnected");
-				}
-			}
+                }
+            }
         }
 
-        void OnUDPReceived(IPEndPoint endPoint, byte[] data, int size)
+        void OnUnreliableReceived(IPEndPoint endPoint, byte[] data, int size)
         {
             int head = 0;
 
@@ -326,59 +625,82 @@ namespace Snowball
                 short channelId = VarintBitConverter.ToShort(packer, out s);
 #endif
 
-                if (channelId == (short)PreservedChannelId.Beacon)
+                IDataChannel channel;
+
+                if (dataChannelMap.TryGetValue(channelId, out channel))
                 {
-                }
-                else if (channelId == (short)PreservedChannelId.Health)
-                {
-                    if (nodeUdpMap.ContainsKey(endPoint))
+                    if (channelId == (short)PreservedChannelId.Beacon)
                     {
-                        ComNode node = nodeUdpMap[endPoint];
-                        node.HealthLostCount = 0;
                     }
-                }
-                else if (channelId == (short)PreservedChannelId.UdpNotify)
-                {
-                    IDataChannel channel = dataChannelMap[channelId];
-                    string userName = (string)channel.FromStream(ref packer);
-                    if (userNodeMap.ContainsKey(userName))
+                    else if (channelId == (short)PreservedChannelId.UdpNotify)
                     {
-                        ComNode node = userNodeMap[userName];
-                        if(node.UdpEndPoint == null)
+                        IssueIdData idData = (IssueIdData)channel.FromStream(ref packer);
+
+                        try
                         {
-                            if (OnConnected != null) OnConnected(node);
-                            node.UdpEndPoint = endPoint;
-                            nodeUdpMap.Add(endPoint, node);
-                            Send(node, (short)PreservedChannelId.UdpNotifyAck, endPoint.Port);
+                            userNodeMapLock.AcquireReaderLock(1000);
+
+                            ComNode n;
+                            if (userNodeMap.TryGetValue(idData.Id, out n))
+                            {
+                                //Util.Log("UdpUserName:" + userName);
+                                ComSnowballNode node = (ComSnowballNode)n;
+
+                                if (node.UdpEndPoint == null && node.AesDecrypter != null)
+                                {
+                                    byte[] decrypted = node.AesDecrypter.Decrypt(idData.encryptionData);
+
+                                    if (decrypted.SequenceEqual(Global.UdpRawData))
+                                    {
+                                        node.UdpEndPoint = endPoint;
+
+                                        if (nodeUdpMap.ContainsKey(endPoint)) nodeUdpMap.Remove(endPoint);
+
+                                        nodeUdpMap.Add(endPoint, node);
+                                        SendInternal(node, (short)PreservedChannelId.UdpNotifyAck, endPoint.Port);
+
+                                        byte[] key = GenerateTmpKey();
+                                        node.TmpKey = key;
+                                        SendInternal(node, (short)PreservedChannelId.Health, key);
+
+                                        node.IsConnected = true;
+                                        if (OnConnected != null) OnConnected(node);
+                                    }
+
+                                }
+
+                            }
                         }
-                        
-                    }
-                }
-                else if (!dataChannelMap.ContainsKey(channelId))
-                {
-                }
-                else
-                {
-                    IDataChannel channel = dataChannelMap[channelId];
-
-                    if (channel.CheckMode == CheckMode.Sequre)
-                    {
-                        if (nodeUdpMap.ContainsKey(endPoint))
+                        finally
                         {
-                            ComNode node = nodeUdpMap[endPoint];
-
-                            node.HealthLostCount = 0;
-
-                            object container = channel.FromStream(ref packer);
-
-                            channel.Received(node, container);
+                            userNodeMapLock.ReleaseReaderLock();
                         }
                     }
                     else
                     {
-                        object container = channel.FromStream(ref packer);
+                        if (channel.CheckMode == CheckMode.Sequre || channel.Encryption == Encryption.Aes)
+                        {
+                            ComNode node;
+                            if (nodeUdpMap.TryGetValue(endPoint, out node))
+                            {
+                                IDecrypter decrypter = null;
+                                if (channel.Encryption == Encryption.Rsa) decrypter = rsaDecrypter;
+                                else if (channel.Encryption == Encryption.Aes) decrypter = node.AesDecrypter;
 
-                        channel.Received(null, container);
+                                object container = channel.FromStream(ref packer, decrypter);
+
+                                channel.Received(node, container);
+                            }
+                        }
+                        else
+                        {
+                            IDecrypter decrypter = null;
+                            if (channel.Encryption == Encryption.Rsa) decrypter = rsaDecrypter;
+
+                            object container = channel.FromStream(ref packer, decrypter);
+
+                            channel.Received(null, container);
+                        }
                     }
 
                 }
@@ -387,39 +709,38 @@ namespace Snowball
             }
         }
 
-        void OnTCPReceived(IPEndPoint endPoint, short channelId, byte[] data, int size)
+        void OnReliableReceived(IPEndPoint endPoint, short channelId, byte[] data, int size)
         {
             if (channelId == (short)PreservedChannelId.Beacon)
             {
+                return;
             }
             else if (channelId == (short)PreservedChannelId.Health)
             {
-                if (nodeTcpMap.ContainsKey(endPoint))
-                {
-                    ComNode node = nodeTcpMap[endPoint];
-                    node.HealthLostCount = 0;
-                }
-            }
-            else if (!dataChannelMap.ContainsKey(channelId))
-            {
+                return;
             }
             else
             {
-                BytePacker packer = new BytePacker(data);
+                IDataChannel channel;
 
-                if (nodeTcpMap.ContainsKey(endPoint))
+                if (dataChannelMap.TryGetValue(channelId, out channel))
                 {
-                    ComNode node = nodeTcpMap[endPoint];
+                    BytePacker packer = new BytePacker(data);
 
-                    node.HealthLostCount = 0;
+                    ComNode node;
+                    if (nodeTcpMap.TryGetValue(endPoint, out node))
+                    {
+                        IDecrypter decrypter = null;
+                        if (channel.Encryption == Encryption.Rsa) decrypter = rsaDecrypter;
+                        else if (channel.Encryption == Encryption.Aes) decrypter = node.AesDecrypter;
 
-                    IDataChannel channel = dataChannelMap[channelId];
+                        object container = channel.FromStream(ref packer, decrypter);
 
-                    object container = channel.FromStream(ref packer);
-
-                    channel.Received(node, container);
+                        channel.Received(node, container);
+                    }
                 }
             }
+
         }
 
         public class CallbackParam
@@ -435,8 +756,26 @@ namespace Snowball
             public bool isRent;
         }
 
+        async Task<int> ReadAsync(NetworkStream nStream, byte[] receiveBuffer, int size, CancellationTokenSource cancelToken)
+        {
+            int tmpSize = 0;
+            int receivedSize = 0;
+            while (true)
+            {
+                tmpSize = await nStream.ReadAsync(receiveBuffer, receivedSize, size - receivedSize, cancelToken.Token).ConfigureAwait(false);
+                if (tmpSize == 0)
+                {
+                    return 0;
+                }
+                receivedSize += tmpSize;
+                if (receivedSize == size)
+                {
+                    return receivedSize;
+                }
+            }
+        }
 
-        public async Task<bool> OnPoll(
+        async Task<bool> OnPoll(
             TCPConnection connection,
             NetworkStream nStream,
             byte[] receiveBuffer,
@@ -445,6 +784,7 @@ namespace Snowball
             )
         {
             int resSize = 0;
+            int tmpSize = 0;
             short channelId = 0;
 
             bool isRent = false;
@@ -452,23 +792,24 @@ namespace Snowball
 
             try
             {
-                resSize = await nStream.ReadAsync(receiveBuffer, 0, 2, cancelToken.Token).ConfigureAwait(false);
+                resSize = await ReadAsync(nStream, receiveBuffer, 2, cancelToken).ConfigureAwait(false);
 
                 if (resSize != 0)
                 {
                     receivePacker.Position = 0;
                     resSize = receivePacker.ReadShort();
 #if DISABLE_CHANNEL_VARINT
-                        await nStream.ReadAsync(receiveBuffer, 0, 2, cancelToken.Token).ConfigureAwait(false);
-                        receivePacker.Position = 0;
-                        channelId = receivePacker.ReadShort();
-                        await nStream.ReadAsync(receiveBuffer, 0, resSize, cancelToken.Token).ConfigureAwait(false);
+                    tmpSize = await ReadAsync(nStream, receiveBuffer, 2, cancelToken).ConfigureAwait(false);
+                    if (tmpSize == 0) throw new EndOfStreamException();
+
+                    receivePacker.Position = 0;
+                    channelId = receivePacker.ReadShort();
 #else
                     int s = 0;
                     channelId = VarintBitConverter.ToShort(nStream, out s);
-                    await nStream.ReadAsync(receiveBuffer, 0, resSize, cancelToken.Token).ConfigureAwait(false);
 #endif
-
+                    tmpSize = await ReadAsync(nStream, receiveBuffer, resSize, cancelToken).ConfigureAwait(false);
+                    if (tmpSize == 0) throw new EndOfStreamException();
 
                     buffer = arrayPool.Rent(resSize);
                     if (buffer != null)
@@ -499,63 +840,35 @@ namespace Snowball
 
             if (cancelToken.IsCancellationRequested) return false;
 
-            if (Global.SyncContext != null)
+            if (syncContext != null)
             {
-                Global.SyncContext.Post((state) =>
+                syncContext.Post((state) =>
                 {
                     if (cancelToken.IsCancellationRequested) return;
                     CallbackParam param = (CallbackParam)state;
-                    OnTCPReceived(param.endPoint, param.channelId, param.buffer, param.size);
+                    OnReliableReceived(param.endPoint, param.channelId, param.buffer, param.size);
                     if (isRent) arrayPool.Return(buffer);
                 }, new CallbackParam((IPEndPoint)connection.Client.Client.RemoteEndPoint, channelId, buffer, resSize, isRent));
             }
             else
             {
-                OnTCPReceived((IPEndPoint)connection.Client.Client.RemoteEndPoint, channelId, buffer, resSize);
+                OnReliableReceived((IPEndPoint)connection.Client.Client.RemoteEndPoint, channelId, buffer, resSize);
             }
 
             return true;
         }
 
-        public async Task<bool> Broadcast<T>(ComGroup group, short channelId, T data, ComNode exception = null)
-        {
-            return await Task.Run(async () => {
-                if (!dataChannelMap.ContainsKey(channelId)) return false;
-
-                IDataChannel channel = dataChannelMap[channelId];
-
-                bool isRent = false;
-                byte[] buffer = null;
-                int bufferSize = 0;
-
-                BuildBuffer(channel, data, ref buffer, ref bufferSize, ref isRent);
-
-                foreach (var node in group.NodeList)
-                {
-                    if (node == exception) continue;
-                    if (!nodeTcpMap.ContainsKey(node.TcpEndPoint)) continue;
-
-                    if (channel.Qos == QosType.Reliable)
-                    {
-                        await ((ComSnowballNode)node).Connection.Send(bufferSize, buffer);
-                    }
-                    else if (channel.Qos == QosType.Unreliable)
-                    {
-                        await udpSender.Send(node.Ip, bufferSize, buffer);
-                    }
-                }
-
-                if (isRent) arrayPool.Return(buffer);
-
-                return true;
-            });
-        }
-
         ArrayPool<byte> arrayPool = ArrayPool<byte>.Create();
 
-        public void BuildBuffer<T>(IDataChannel channel, T data, ref byte[] buffer, ref int bufferSize, ref bool isRent)
+        void BuildBuffer<T>(
+            IDataChannel channel, T data, ref byte[] buffer, ref int bufferSize, ref bool isRent, IEncrypter encrypter
+            )
         {
             isRent = true;
+
+            if (channel.Encryption == Encryption.Rsa)
+                throw new InvalidOperationException("Server cant send data via RSA channel.");
+
             int bufSize = channel.GetDataSize(data);
             int lz4ext = 0;
             if (channel.Compression == Compression.LZ4) lz4ext = 4;
@@ -571,14 +884,14 @@ namespace Snowball
             packer.Write((short)bufSize);
 
 #if DISABLE_CHANNEL_VARINT
-            packer.Write(channelId);
+            packer.Write(channel.ChannelID);
 #else
             int s = 0;
             VarintBitConverter.SerializeShort(channel.ChannelID, packer, out s);
 #endif
             int start = packer.Position;
 
-            channel.ToStream(data, ref packer);
+            channel.ToStream(data, ref packer, encrypter);
 
             bufferSize = (int)packer.Position;
 
@@ -586,34 +899,93 @@ namespace Snowball
             packer.Write((short)(bufferSize - start));
         }
 
+        public async Task<bool> Broadcast<T>(ComGroup group, short channelId, T data, ComNode exception = null)
+        {
+            IDataChannel channel;
+            if (!dataChannelMap.TryGetValue(channelId, out channel)) return false;
+
+            bool isRent = false;
+            byte[] buffer = null;
+            int bufferSize = 0;
+
+            if (channel.Encryption == Encryption.None)
+            {
+                BuildBuffer(channel, data, ref buffer, ref bufferSize, ref isRent, null);
+            }
+
+            foreach (var node in group)
+            {
+                if (node == exception) continue;
+
+                if (!nodeTcpMap.ContainsKey(node.TcpEndPoint)) continue;
+
+                if (channel.Encryption == Encryption.Aes)
+                {
+                    BuildBuffer(channel, data, ref buffer, ref bufferSize, ref isRent, node.AesEncrypter);
+                }
+
+                ComSnowballNode snode = (ComSnowballNode)node;
+                if (channel.Qos == QosType.Reliable)
+                {
+                    await snode.Connection.Send(bufferSize, buffer);
+                }
+                else if (channel.Qos == QosType.Unreliable)
+                {
+                    if (snode.UdpEndPoint != null)
+                    {
+                        await udpTerminal.Send(snode.Ip, snode.UdpEndPoint.Port, bufferSize, buffer);
+                    }
+
+                }
+            }
+
+            if (isRent) arrayPool.Return(buffer);
+
+            return true;
+        }
 
         public async Task<bool> Send<T>(ComNode node, short channelId, T data)
         {
-            return await Task.Run(async () => {
-                if (!nodeTcpMap.ContainsKey(node.TcpEndPoint)) return false;
-                if (!dataChannelMap.ContainsKey(channelId)) return false;
+            if (!node.IsConnected) return false;
+            else return await SendInternal<T>(node, channelId, data);
+        }
 
-                IDataChannel channel = dataChannelMap[channelId];
+        async Task<bool> SendInternal<T>(ComNode node, short channelId, T data)
+        {
+            return await Task.Run(async () =>
+            {
+                if (!nodeTcpMap.ContainsKey(node.TcpEndPoint)) return false;
+
+                IDataChannel channel;
+
+                if (!dataChannelMap.TryGetValue(channelId, out channel)) return false;
 
                 bool isRent = false;
                 byte[] buffer = null;
                 int bufferSize = 0;
 
-                BuildBuffer(channel, data, ref buffer, ref bufferSize, ref isRent);
+                IEncrypter encrypter = null;
+                if (channel.Encryption == Encryption.Aes) encrypter = node.AesEncrypter;
 
+                BuildBuffer(channel, data, ref buffer, ref bufferSize, ref isRent, encrypter);
+
+                ComSnowballNode snode = (ComSnowballNode)node;
                 if (channel.Qos == QosType.Reliable)
                 {
-                    await ((ComSnowballNode)node).Connection.Send(bufferSize, buffer);
+                    await snode.Connection.Send(bufferSize, buffer).ConfigureAwait(false);
                 }
                 else if (channel.Qos == QosType.Unreliable)
                 {
-                    await udpSender.Send(node.Ip, bufferSize, buffer);
+                    if (snode.UdpEndPoint != null)
+                    {
+                        await udpTerminal.Send(snode.Ip, snode.UdpEndPoint.Port, bufferSize, buffer).ConfigureAwait(false);
+                    }
                 }
 
                 if (isRent) arrayPool.Return(buffer);
 
                 return true;
-            });
+            }).ConfigureAwait(false);
 
         }
 

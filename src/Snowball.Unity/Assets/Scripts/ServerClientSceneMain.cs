@@ -34,9 +34,14 @@ public class ServerClientSceneMain : MonoBehaviour
 
     [SerializeField]
     GameObject serverObject;
+    MeshRenderer serverRenderer;
 
     [SerializeField]
     GameObject clientObject;
+    MeshRenderer clientRenderer;
+
+    [SerializeField]
+    int numSend = 70;
 
     // Start is called before the first frame update
     void Start()
@@ -51,24 +56,54 @@ public class ServerClientSceneMain : MonoBehaviour
         QualitySettings.vSyncCount = 0;
         Application.targetFrameRate = 60;
 
-        server.AddChannel(new DataChannel<ObjState>(0, QosType.Unreliable, Snowball.Compression.LZ4, (node, data) => {
+        serverRenderer = serverObject.gameObject.GetComponent<MeshRenderer>();
+        clientRenderer = clientObject.gameObject.GetComponent<MeshRenderer>();
+
+        server.AddChannel(new DataChannel<ObjState>(0, QosType.Unreliable, Snowball.Compression.None, Encryption.None, (node, data) => {
             serverObject.transform.localPosition = data.Position;
             serverObject.transform.localRotation = data.Rotation;
         }, CheckMode.Speedy));
 
-        server.AddChannel(new DataChannel<string>(1, QosType.Reliable, Snowball.Compression.None, (node, data) => {
+        server.AddChannel(new DataChannel<string>(1, QosType.Reliable, Snowball.Compression.None, Encryption.Aes, (node, data) => {
             Debug.Log("rec:" + data);
         }));
 
-        client.AddChannel(new DataChannel<ObjState>(0, QosType.Unreliable, Snowball.Compression.LZ4, (node, data) => {
+        server.AddChannel(new DataChannel<Color>(2, QosType.Reliable, Snowball.Compression.None, Encryption.Aes, (node, data) => {
+            serverRenderer.material.SetColor("_Color", data);
+        }));
+
+        client.AddChannel(new DataChannel<ObjState>(0, QosType.Unreliable, Snowball.Compression.None, Encryption.None, (node, data) => {
         }, CheckMode.Speedy));
 
-        client.AddChannel(new DataChannel<string>(1, QosType.Reliable, Snowball.Compression.None, (node, data) => {
+        client.AddChannel(new DataChannel<string>(1, QosType.Reliable, Snowball.Compression.None, Encryption.Aes, (node, data) => {
+        }));
+
+        client.AddChannel(new DataChannel<Color>(2, QosType.Reliable, Snowball.Compression.None, Encryption.Aes, (node, data) => {
         }));
 
 
-        client.AcceptBeacon = true;
+        server.OnConnected += (node) =>
+        {
+            if (node != null) Debug.Log("Server:Connected");
+        };
+
+        server.OnDisconnected += (node) =>
+        {
+            if (node != null) Debug.Log("Server:Disconnected");
+        };
+
+        client.OnConnected += (node) =>
+        {
+            if (node != null) Debug.Log("Client:Connected");
+        };
+
+        client.OnDisconnected += (node) =>
+        {
+            if (node != null) Debug.Log("Client:Disconnected");
+        };
+
         client.Open();
+        client.AcceptBeacon = true;
 
         server.AddBeaconList(IPAddress.Broadcast.ToString());
         server.Open();
@@ -91,7 +126,7 @@ public class ServerClientSceneMain : MonoBehaviour
         {
             ObjState state = new ObjState(clientObject.transform.localPosition, clientObject.transform.localRotation);
 
-            for(int i = 0; i < 70; i++)
+            for(int i = 0; i < numSend; i++)
             {
                 client.Send(0, state);
             }
@@ -101,6 +136,18 @@ public class ServerClientSceneMain : MonoBehaviour
         if (Input.GetKeyDown(KeyCode.Alpha1))
         {
             client.Send(1, "Hello Unity!");
+        }
+
+        if(Input.GetKeyDown(KeyCode.C))
+        {
+            Color color = new Color(
+                Random.Range(0.0f, 1.0f),
+                Random.Range(0.0f, 1.0f),
+                Random.Range(0.0f, 1.0f),
+                1.0f
+                );
+            clientRenderer.material.SetColor("_Color", color);
+            client.Send(2, color);
         }
     }
 

@@ -8,29 +8,32 @@ using System.Threading.Tasks;
 
 namespace Snowball
 {
-    public class ComTerminal : IDisposable
+    public sealed class ComTerminal : IDisposable
     {
-        public bool IsOpened { get; protected set; }
+        public bool IsOpened { get; private set; }
 
-        int listenPortNumber = 59902;
+        int listenPortNumber = 0;
         public int ListenPortNumber { get { return listenPortNumber; } set { if (!IsOpened) listenPortNumber = value; } }
 
-        int sendPortNumber = 59901;
-        public int SendPortNumber { get { return sendPortNumber; } set { if (!IsOpened) sendPortNumber = value; } }
+        int portNumber = 32001;
+        public int PortNumber { get { return portNumber; } set { if (!IsOpened) portNumber = value; } }
 
         int bufferSize = 8192;
         public int BufferSize { get { return bufferSize; } set { if (!IsOpened) bufferSize = value; } }
 
-        protected Dictionary<short, IDataChannel> dataChannelMap = new Dictionary<short, IDataChannel>();
+        Dictionary<short, IDataChannel> dataChannelMap = new Dictionary<short, IDataChannel>();
 
-        UDPSender udpSender;
-        UDPReceiver udpReceiver;
+        UDPTerminal udpTerminal;
 
-        protected Dictionary<string, ComNode> nodeUdpMap = new Dictionary<string, ComNode>();
+        Dictionary<string, ComNode> nodeUdpMap = new Dictionary<string, ComNode>();
 
-        public ComTerminal()
+        bool userSyncContext;
+        SynchronizationContext syncContext;
+
+        public ComTerminal(bool userSyncContext = true)
         {
             IsOpened = false;
+            this.userSyncContext = userSyncContext;
         }
 
         public void Dispose()
@@ -38,51 +41,49 @@ namespace Snowball
             Close();
         }
 
-        public virtual void Open()
+        public void Open()
         {
             if (IsOpened) return;
 
-            if (Global.UseSyncContextPost && Global.SyncContext == null)
-                Global.SyncContext = SynchronizationContext.Current;
-
-            if(sendPortNumber != 0)
+            if (userSyncContext)
             {
-                udpSender = new UDPSender(sendPortNumber, bufferSize);
+                syncContext = SynchronizationContext.Current;
+                if (syncContext == null)
+                {
+                    syncContext = new SnowballSynchronizationContext(10);
+                    SynchronizationContext.SetSynchronizationContext(syncContext);
+                }
             }
 
-            if(listenPortNumber != 0)
-            {
-                udpReceiver = new UDPReceiver(listenPortNumber, bufferSize);
-                udpReceiver.OnReceive += OnUDPReceived;
+            int port = portNumber;
+            if (listenPortNumber != 0) port = listenPortNumber;
 
-                udpReceiver.Start();
-            }
-            
+            udpTerminal = new UDPTerminal(port, bufferSize);
+            udpTerminal.SyncContext = syncContext;
+            udpTerminal.OnReceive += OnUnreliableReceived;
+
+            udpTerminal.ReceiveStart();
 
             IsOpened = true;
         }
 
-        public virtual void Close()
+        public void Close()
         {
             if (!IsOpened) return;
 
-            if (listenPortNumber != 0)
+            if(udpTerminal != null)
             {
-                udpReceiver.Close();
-                udpReceiver = null;
+                udpTerminal.Close();
+                udpTerminal = null;
             }
-            if (sendPortNumber != 0)
-            {
-                udpSender = null;
-            }
-
+               
             IsOpened = false;
         }
 
         public void AddAcceptList(string ip)
         {
             IPAddress address = IPAddress.Parse(ip);
-            ComNode node = new ComNode(new IPEndPoint(address, sendPortNumber));
+            ComNode node = new ComNode(new IPEndPoint(address, portNumber));
             nodeUdpMap.Add(ip, node);
         }
 
@@ -97,6 +98,11 @@ namespace Snowball
             {
                 throw new ArgumentException("Qos type is not valid.");
             }
+
+            if (channel.Encryption != Encryption.None)
+            {
+                throw new ArgumentException("ComTerminal can not use encryption.");
+            }
             dataChannelMap.Add(channel.ChannelID, channel);
         }
 
@@ -105,7 +111,7 @@ namespace Snowball
             dataChannelMap.Remove(channel.ChannelID);
         }
 
-        void OnUDPReceived(IPEndPoint endPoint, byte[] data, int size)
+        void OnUnreliableReceived(IPEndPoint endPoint, byte[] data, int size)
         {
             int head = 0;
 
@@ -119,20 +125,16 @@ namespace Snowball
                 int s = 0;
                 short channelId = VarintBitConverter.ToShort(packer, out s);
 #endif
-                if (!dataChannelMap.ContainsKey(channelId))
-                {
-                }
-                else
-                {
-                    IDataChannel channel = dataChannelMap[channelId];
+                IDataChannel channel;
 
+                if (dataChannelMap.TryGetValue(channelId, out channel))
+                {
                     if (channel.CheckMode == CheckMode.Sequre)
                     {
-                        if (nodeUdpMap.ContainsKey(endPoint.Address.ToString()))
+                        ComNode node;
+                        if (nodeUdpMap.TryGetValue(endPoint.Address.ToString(), out node))
                         {
-                            ComNode node = nodeUdpMap[endPoint.Address.ToString()];
-
-                            object container = channel.FromStream(ref packer);
+                            object container = channel.FromStream(ref packer, null);
 
                             channel.Received(node, container);
                         }
@@ -140,7 +142,7 @@ namespace Snowball
 
                     else
                     {
-                        object container = channel.FromStream(ref packer);
+                        object container = channel.FromStream(ref packer, null);
                         channel.Received(null, container);
                     }
  
@@ -149,13 +151,11 @@ namespace Snowball
                 head += datasize + 4;
 
             }
-
-
         }
 
         ArrayPool<byte> arrayPool = ArrayPool<byte>.Create();
 
-        public void BuildBuffer<T>(IDataChannel channel, T data, ref byte[] buffer, ref int bufferSize, ref bool isRent)
+        void BuildBuffer<T>(IDataChannel channel, T data, ref byte[] buffer, ref int bufferSize, ref bool isRent)
         {
             isRent = true;
             int bufSize = channel.GetDataSize(data);
@@ -191,12 +191,12 @@ namespace Snowball
 
         public async Task<bool> Send<T>(ComNode node, short channelId, T data)
         {
-            if (sendPortNumber == 0) return false;
+            if (portNumber == 0) return false;
 
             return await Task.Run(async () => {
-                if (!dataChannelMap.ContainsKey(channelId)) return false;
 
-                IDataChannel channel = dataChannelMap[channelId];
+                IDataChannel channel;
+                if (!dataChannelMap.TryGetValue(channelId, out channel)) return false;
 
                 bool isRent = false;
                 byte[] buffer = null;
@@ -204,12 +204,12 @@ namespace Snowball
 
                 BuildBuffer(channel, data, ref buffer, ref bufferSize, ref isRent);
 
-                await udpSender.Send(node.Ip, bufferSize, buffer);
+                await udpTerminal.Send(node.Ip, portNumber, bufferSize, buffer).ConfigureAwait(false);
 
                 if (isRent) arrayPool.Return(buffer);
 
                 return true;
-            });
+            }).ConfigureAwait(false);
 
         }
 

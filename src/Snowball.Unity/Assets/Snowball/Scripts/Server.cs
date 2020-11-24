@@ -8,28 +8,32 @@ namespace Snowball
     public class Server : MonoBehaviour
     {
         [SerializeField]
-        int DefaultSendPort = 59902;
+        int DefaultBeaconPort = 32000;
 
         [SerializeField]
-        int DefaultListenPort = 59901;
+        int DefaultPort = 32001;
 
         [SerializeField]
         int DefaultBufferSize = 8192;
 
         public bool IsOpened { get { return com.IsOpened; } }
 
-        public int SendPort { get { return com.SendPortNumber; } set { com.SendPortNumber = value; } }
-        public int ListenPort { get { return com.ListenPortNumber; } set { com.ListenPortNumber = value; } }
-        [SerializeField]
-        public int BufferSize { get { return com.BufferSize; } set { com.BufferSize = value; } }
+        public int BeaconPort { get { return com.BeaconPortNumber; } private set { com.BeaconPortNumber = value; } }
+        public int Port { get { return com.PortNumber; } private set { com.PortNumber = value; } }
+        public int BufferSize { get { return com.BufferSize; } private set { com.BufferSize = value; } }
 
         public ComServer.ConnectedHandler OnConnected { get { return com.OnConnected; } set { com.OnConnected = value; } }
         public ComServer.DisconnectedHandler OnDisconnected { get { return com.OnDisconnected; } set { com.OnDisconnected = value; } }
 
         public void SetBeaconDataCreateFunction(ComServer.BeaconDataGenerateFunc func) { com.SetBeaconDataCreateFunction(func); }
 
+        public void SetRsaKeyGenerateFunction(ComServer.RsaKeyGenerateFunc func) { com.SetRsaKeyGenerateFunction(func); }
+
+
         public int BeaconIntervalMs { get { return com.BeaconIntervalMs; } set { com.BeaconIntervalMs = value; } }
         public int MaxHealthLostCount { get { return com.MaxHealthLostCount; } set { com.MaxHealthLostCount = value; } }
+
+        public int RemoveIntervalSec { get { return com.RemoveIntervalSec; } set { com.RemoveIntervalSec = value; } }
 
         ComServer com = new ComServer();
         public ComServer ComServer { get { return com; } }
@@ -53,8 +57,8 @@ namespace Snowball
 
         public void Open()
         {
-			this.SendPort = DefaultSendPort;
-			this.ListenPort = DefaultListenPort;
+            this.BeaconPort = DefaultBeaconPort;
+            this.Port = DefaultPort;
 			this.BufferSize = DefaultBufferSize;
 
 			com.Open();

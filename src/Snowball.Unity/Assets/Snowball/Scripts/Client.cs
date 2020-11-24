@@ -7,31 +7,34 @@ namespace Snowball
 {
     public class Client : MonoBehaviour
     {
-		[SerializeField]
-		string DefaultUserName = "u001";
-
-		[SerializeField]
-        int DefaultSendPort = 59901;
+        [SerializeField]
+        int DefaultBeaconPort = 32000;
 
         [SerializeField]
-        int DefaultListenPort = 59902;
+        int DefaultPort = 32001;
+
+        [SerializeField]
+        int DefaultListenPort = 0;
 
         [SerializeField]
         int DefaultBufferSize = 8192;
 
         public bool IsOpened { get { return com.IsOpened; } }
 
-        public string UserName { get { return com.UserName; } set { com.UserName = value; DefaultUserName = value; } }
+        public int UserId { get { return com.UserId; } }
 
-        public int SendPort { get { return com.SendPortNumber; } set { com.SendPortNumber = value; } }
-        public int ListenPort { get { return com.ListenPortNumber; } set { com.ListenPortNumber = value; } }
-        [SerializeField]
-        public int BufferSize { get { return com.BufferSize; } set { com.BufferSize = value; } }
+        public int BeaconPort { get { return com.BeaconPortNumber; } private set { com.BeaconPortNumber = value; } }
+        public int Port { get { return com.PortNumber; } private set { com.PortNumber = value; } }
+        public int ListenPort { get { return com.ListenPortNumber; } private set { com.ListenPortNumber = value; } }
+        public int BufferSize { get { return com.BufferSize; } private set { com.BufferSize = value; } }
 
         public ComClient.ConnectedHandler OnConnected { get { return com.OnConnected; } set { com.OnConnected = value; } }
         public ComClient.DisconnectedHandler OnDisconnected { get { return com.OnDisconnected; } set { com.OnDisconnected = value; } }
 
         public void SetBeaconAcceptFunction(ComClient.BeaconAcceptFunc func) { com.SetBeaconAcceptFunction(func); }
+
+        public void SetValidateRsaKeyFunction(ComClient.ValidateRsaKeyFunc func) { com.SetValidateRsaKeyFunction(func); }
+
 
         public int MaxHealthLostCount { get { return com.MaxHealthLostCount; } set { com.MaxHealthLostCount = value; } }
 
@@ -51,8 +54,8 @@ namespace Snowball
 
         public void Open()
         {
-			this.UserName = DefaultUserName;
-			this.SendPort = DefaultSendPort;
+            this.BeaconPort = DefaultBeaconPort;
+			this.Port = DefaultPort;
 			this.ListenPort = DefaultListenPort;
 			this.BufferSize = DefaultBufferSize;
 

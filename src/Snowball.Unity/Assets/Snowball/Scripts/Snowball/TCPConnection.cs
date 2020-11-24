@@ -57,6 +57,8 @@ namespace Snowball
 
         NetworkStream nStream;
 
+        public SynchronizationContext SyncContext { get; set; }
+
         public delegate Task<bool> PollHandler(
             TCPConnection connection,
             NetworkStream nStream,
@@ -90,7 +92,7 @@ namespace Snowball
 
         }
 
-        ~TCPConnection()
+        public void Dispose()
         {
             Disconnect();
         }
@@ -101,7 +103,7 @@ namespace Snowball
             {
                 try
                 {
-                    if (!cancelToken.IsCancellationRequested)
+                    if (nStream != null && !cancelToken.IsCancellationRequested)
                     {
                         cancelToken.Cancel();
                         OnPoll = null;
@@ -109,9 +111,12 @@ namespace Snowball
                         nStream.Close();
                         client.Close();
 
-                        if (Global.SyncContext != null)
+                        nStream = null;
+                        client = null;
+
+                        if (SyncContext != null)
                         {
-                            Global.SyncContext.Post((state) =>
+                            SyncContext.Post((state) =>
                             {
                                 if (OnDisconnected != null) OnDisconnected(this);
                             }, null);
@@ -127,7 +132,6 @@ namespace Snowball
                 {
                     //Util.Log("Disconnect" + e.Message);
                 }
-
             }
 
         }
@@ -137,6 +141,12 @@ namespace Snowball
             this.client = client;
             this.IP = ((IPEndPoint)client.Client.RemoteEndPoint).Address.ToString();
             this.Port = ((IPEndPoint)client.Client.RemoteEndPoint).Port;
+        }
+
+        public void SetSocketOption(SocketOptionLevel level, SocketOptionName name, bool value)
+        {
+            Socket socket = client.Client;
+            socket.SetSocketOption(level, name, value);
         }
 
         public bool IsConnected { get { return client.Connected; } }
@@ -149,7 +159,7 @@ namespace Snowball
             {
                 if(OnPoll != null)
                 {
-                    var ret = await OnPoll(this, nStream, receiveBuffer, receivePacker, cancelToken);
+                    var ret = await OnPoll(this, nStream, receiveBuffer, receivePacker, cancelToken).ConfigureAwait(false);
                     if (!ret) break;
                 }
                 

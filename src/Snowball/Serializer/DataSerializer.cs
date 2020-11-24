@@ -25,38 +25,43 @@ namespace Snowball
         {
             if (!setup) Setup();
 
-            if (!converterMap.ContainsKey(typeof(T)))
+            Converter converter;
+            if (!converterMap.TryGetValue(typeof(T), out converter))
             {
-                converterMap.Add(typeof(T), GetConverter(typeof(T)));
+                converter = GetConverter(typeof(T));
+                converterMap.Add(typeof(T), converter);
             }
-            converterMap[typeof(T)].Serialize(packer, data);
+            converter.Serialize(packer, data);
         }
 
         public static T Deserialize<T>(BytePacker packer)
         {
             if (!setup) Setup();
 
-            if (!converterMap.ContainsKey(typeof(T))){
-                converterMap.Add(typeof(T), GetConverter(typeof(T)));
+            Converter converter;
+            if (!converterMap.TryGetValue(typeof(T), out converter)){
+                converter = GetConverter(typeof(T));
+                converterMap.Add(typeof(T), converter);
             }
-            return (T)converterMap[typeof(T)].Deserialize(packer);
+            return (T)converter.Deserialize(packer);
         }
 
         public static Converter GetConverter(Type type)
         {
             if (!setup) Setup();
 
-            if (constractorMap.ContainsKey(type))
+            ConverterConstractor constractor;
+            if (constractorMap.TryGetValue(type, out constractor))
             {
                 //already registered
-                return constractorMap[type]();
+                return constractor();
             }
             else if (type.IsEnum)
             {
                 //enum
-                if (constractorMap.ContainsKey(Enum.GetUnderlyingType(type)))
+                if (constractorMap.TryGetValue(Enum.GetUnderlyingType(type), out constractor))
                 {
-                    return constractorMap[Enum.GetUnderlyingType(type)]();
+                    return constractor();
                 }
             }
             else if (type.IsArray)
@@ -114,14 +119,13 @@ namespace Snowball
 
             constractorMap.Add(typeof(byte[]), ByteArrayConverter.constract);
 
-#if UNITY_2017_1_OR_NEWER
-
             constractorMap.Add(typeof(Vector2), Vector2Converter.constract);
             constractorMap.Add(typeof(Vector3), Vector3Converter.constract);
             constractorMap.Add(typeof(Vector4), Vector4Converter.constract);
             constractorMap.Add(typeof(Quaternion), QuaternionConverter.constract);
 
-#endif
+            constractorMap.Add(typeof(Color), ColorConverter.constract);
+            constractorMap.Add(typeof(Color32), Color32Converter.constract);
 
             setup = true;
         }

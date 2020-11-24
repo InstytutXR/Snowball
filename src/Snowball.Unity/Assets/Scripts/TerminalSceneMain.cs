@@ -19,6 +19,9 @@ public class TerminalSceneMain : MonoBehaviour
     [SerializeField]
     GameObject clientObject;
 
+    [SerializeField]
+    int numSend = 70;
+
     // Start is called before the first frame update
     void Start()
     {
@@ -32,12 +35,12 @@ public class TerminalSceneMain : MonoBehaviour
         QualitySettings.vSyncCount = 0;
         Application.targetFrameRate = 60;
 
-        server.AddChannel(new DataChannel<ObjState>(0, QosType.Unreliable, Snowball.Compression.LZ4, (node, data) => {
+        server.AddChannel(new DataChannel<ObjState>(0, QosType.Unreliable, Snowball.Compression.LZ4, Encryption.None, (node, data) => {
             serverObject.transform.localPosition = data.Position;
             serverObject.transform.localRotation = data.Rotation;
         }, CheckMode.Speedy));
 
-        client.AddChannel(new DataChannel<ObjState>(0, QosType.Unreliable, Snowball.Compression.LZ4, (node, data) => {
+        client.AddChannel(new DataChannel<ObjState>(0, QosType.Unreliable, Snowball.Compression.LZ4, Encryption.None, (node, data) => {
         }, CheckMode.Speedy));
 
 
@@ -47,7 +50,7 @@ public class TerminalSceneMain : MonoBehaviour
         //server.AddAcceptList("127.0.0.1");
         server.Open();
 
-        IPEndPoint endPoint = new IPEndPoint(IPAddress.Loopback, client.SendPort);
+        IPEndPoint endPoint = new IPEndPoint(IPAddress.Loopback, client.Port);
         lnode = new ComNode(endPoint);
     }
 
@@ -65,7 +68,7 @@ public class TerminalSceneMain : MonoBehaviour
 
         ObjState state = new ObjState(clientObject.transform.localPosition, clientObject.transform.localRotation);
 
-        for (int i = 0; i < 70; i++)
+        for (int i = 0; i < numSend; i++)
         {
             client.Send(lnode, 0, state);
         }

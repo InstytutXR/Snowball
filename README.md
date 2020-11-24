@@ -25,8 +25,6 @@ You can download Unity Package of Snowball from [github](https://github.com/nakk
 
 In Snowball, relatively new features of C# are userd (ex. async/await), so you must set "Scripting Runtime Version" to ". NET 4.x".
 
-LZ4 Compression uses unsafe functions, so you must allow unsafe code in Player Settings.
-
 ## Quick Start
 Declear "using" directive if you need.
 
@@ -40,8 +38,8 @@ Server side examples are as follows.
 ComServer server = new ComServer();
 
 //Add Data Channel (Channel Id 0 is string data transfer.)
-server.AddChannel(new DataChannel<string>(0, QosType.Reliable, Compression.None, (node, data) =>{
-	Util.Log("Server-Receive:" + data);                
+server.AddChannel(new DataChannel<string>(0, QosType.Reliable, Compression.None, Encryption.None, (node, data) =>{
+    Util.Log("Server-Receive:" + data);                
 }));
 
 //Beacon Setting(Broadcast)
@@ -60,33 +58,46 @@ Those of client side are as follows.
 ComClient client = new ComClient();
 
 //Add Data Channel (Channel Id 0 is string data transfer.)
-client.AddChannel(new DataChannel<string>(0, QosType.Reliable, Compression.None, (node, data) => {
-	Util.Log("Client Receive:" + data);       
+client.AddChannel(new DataChannel<string>(0, QosType.Reliable, Compression.None, Encryption.None, (node, data) => {
+    Util.Log("Client Receive:" + data);       
 }));
 
-//Beacon Setting(Accept)
-client.AcceptBeacon = true;
+//When launching multiple Snowball applications locally, 
+//it is necessary to set different values ​​for ListenPortNumber.
+client.ListenPortNumber = client.PortNumber + 1;
+
 //Start Client
 client.Open();
+//You can also connect to the server by using Connect function.
+//client.Connect("127.0.0.1");
+
+//Beacon
+client.AcceptBeacon = true;
 ```
-Beacon is useful to connect/reconnet to a server. But Beacon involves Security Risk, so if you use Beacon via internet, the service must be carefully designed.
+Beacon is useful to connect/reconnet to a server, but Beacon probably not available over the internet due to firewall.
 
 Sending examples are as follows. 
 
+Server:
 ```csharp
-ComNode node = server.GetNodeByIp(ip);
+IPEndPoint clientEndPoint = new IPEndPoint(address, port);
+ComNode node = server.GetTcpNodeByEndPoint(clientEndPoint);
 server.Send(node, 0, "Hello Client!");
 ```
+You can also get ComNode in OnConnected Handler.
+
+Client:
 ```csharp
 client.Send(0, "Hello Server!");
 ```
 
 And ComClient and ComServer should be closed on termination. (ex. Dispose())
  
+ Server:
 ```csharp
 server.Close();
 ```
-
+Client:
 ```csharp
 client.Close();
 ```
@@ -111,21 +122,24 @@ Snowball consists of "ComServer" and "ComClient". ComClient connect to ComServer
 
 ### Server/Client
 
-ComServer and ComClient can be set some parameters (ex. Send Port, Receive Port, Buffer Size...). You can set those parameters before Open().  
-Snowball use UDP, though if you want to test on localhost, you can not use same port in Send and Receive (Two UDP sockets can not be bind to the same port). In those case, you should set contrasting numbers to Server and Client respectively.  
-(Default port numbers are contrasting.)
+ComServer and ComClient can be set some parameters (ex. Port Number, Buffer Size...). You can set those parameters before Open().  
+Snowball use UDP, though if you want to test on localhost, you can not use same port in two application (Two UDP sockets can not be bind to the same port). In those case, you should set different number to Client Listen Port.  
+(The Default value of ListenPortNumber is 0, and if 0 is set, UDP ListenPortNumber will be the same value as PortNumber.)
 
 ```csharp
-server.SendPortNumber = 50001;
-server.ListenPortNumber = 50002;
+server.PortNumber = 32001;
 server.Open();
 ```
 
 ```csharp
-client.SendPortNumber = 50002;
-client.ListenPortNumber = 50001;
+client.PortNumber = 32001;
+//client.ListenPortNumber = 32002;
 client.Open();
 ```
+
+Multiple Clients can be launched by setting different ListenPortNumbers. This is useful for stress tests etc.   
+Also, since UDP is also used for Beacon, you have to stop using Beacon with AcceptBeacon = false. or use a different value for BeaconPortNumber.
+
 
 
 ### Data Channel
@@ -135,16 +149,22 @@ client.Open();
 ComServer and ComClient are registered some Data Channels. A Data Channel has transfer settings and can be set a Data Receive Handler.  
 For example, if you want to transfer chat text data between server and client, you should create a Data Channel for text data translation and register server and client respectively.  
 
-Data Channel also can be set QoS Type (Reliable / Unreliable), and compression setting. 
+Data Channel also can be set QoS Type (Reliable / Unreliable), and compression, encryption setting. 
 
 ```csharp
-client.AddChannel(new DataChannel<string>(0, QosType.Reliable, Compression.None, (node, data) => {
-	Util.Log("Client Receive:" + data);       
+client.AddChannel(new DataChannel<string>(0, QosType.Reliable, Compression.None, Encryption.None, (node, data) => {
+    Util.Log("Client Receive:" + data);       
 }));
-client.AddChannel(new DataChannel<TestClass>(1, QosType.Unreliable, Compression.LZ4, (node, data) => {
-	Util.Log("Client Receive:" + data.ToString());       
+client.AddChannel(new DataChannel<TestClass>(1, QosType.Unreliable, Compression.LZ4, Encryption.None, (node, data) => {
+    Util.Log("Client Receive:" + data.ToString());       
 }));
 ```
+
+### Channel Settings
+
+Reliable and Unreliable are available for QoS, and LZ4 is prepared for compression.
+For Encryption, RSA and AES are available, but RSA is implemented only for exchanging common AES keys, so it has many limitations. Also in terms of speed, use only AES.
+
 
 ### Data Types
 
@@ -158,7 +178,8 @@ Othres : [DateTime, TimeSpan]
 
 #### Unity Extension
 
-Transform : [Vector2, Vector3, Vector4, Quaternion]
+Transform : [Vector2, Vector3, Vector4, Quaternion]  
+Color : [Color, Color32]
 
 #### Custom Attributed Class
 
@@ -194,7 +215,8 @@ We also implement BroadCasting API and Group of ComNode as ComGroup, and ComGrou
 
 ```csharp
 //Send to a client
-ComNode node = server.GetNodeByIp(ip);
+IPEndPoint clientEndPoint = new IPEndPoint(address, port);
+ComNode node = server.GetTcpNodeByEndPoint(clientEndPoint);
 server.Send(node, 0, "Hello Client!");
 
 //Send to group members
@@ -208,7 +230,8 @@ server.Broadcast(group, 0, "Hello Everyone!");
 <img src="https://user-images.githubusercontent.com/5203051/59557933-1c9ecb00-9021-11e9-923d-531089a22b3c.png" height="400">
 
 ComServer can send beacon signals at regular intervals, and when a client catches a beacon, it connects to server without setting IP Address manually.  
-If you want to implement communication between terminals in a LAN, Broadcast beacon is very useful.
+If you want to implement communication between terminals in a LAN, Broadcast beacon is very useful.   
+On the other hand, it cannot often be used via the Internet because Bearon packet cannot pass through the firewall.
 
 ```csharp
 //Beacon Settings(Broadcast)
@@ -234,8 +257,8 @@ Also, client can be set a function about checking beacon data.
 
 ```csharp
 client.SetBeaconAcceptFunction((data) => {
-	if (data == "Test") return true;
-	else return false;
+    if (data == "Test") return true;
+    else return false;
 });
 ```
 

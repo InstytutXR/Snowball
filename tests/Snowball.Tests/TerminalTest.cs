@@ -18,14 +18,13 @@ namespace Snowball.Tests
         TerminalFixture server;
 
         Compression comp = Compression.LZ4;
+        Encryption enc = Encryption.None;
         CheckMode checkMode = CheckMode.Speedy;
 
         public TerminalTest(ITestOutputHelper logger, TerminalFixture terminal)
         {
             this.logger = logger;
             this.server = terminal;
-
-            Global.UseSyncContextPost = false;
         }
 
         public void Dispose()
@@ -39,8 +38,8 @@ namespace Snowball.Tests
             Util.Log("OpenClose");
 
             ComTerminal terminal = new ComTerminal();
-            terminal.ListenPortNumber = this.server.SendPort;
-            terminal.SendPortNumber = this.server.ListenPort;
+            terminal.ListenPortNumber = this.server.Port;
+            terminal.PortNumber = this.server.Port + 1;
             terminal.Open();
 
             terminal.Close();
@@ -53,8 +52,8 @@ namespace Snowball.Tests
             Util.Log("SendReceive");
 
             ComTerminal terminal = new ComTerminal();
-            terminal.ListenPortNumber = this.server.SendPort;
-            terminal.SendPortNumber = this.server.ListenPort;
+            terminal.ListenPortNumber = this.server.Port;
+            terminal.PortNumber = this.server.Port + 1;
 
             terminal.AddAcceptList(IPAddress.Loopback.ToString());
 
@@ -81,49 +80,49 @@ namespace Snowball.Tests
             testData.stringData = "Are you human?";
 
             //Bool
-            terminal.AddChannel(new DataChannel<bool>((short)ChannelId.BoolUnRel, QosType.Unreliable, comp, (node, data) =>
+            terminal.AddChannel(new DataChannel<bool>((short)ChannelId.BoolUnRel, QosType.Unreliable, comp, enc, (node, data) =>
             {
                 if (data == boolData) boolCheck = true;
             }, checkMode));
 
             //Byte
-            terminal.AddChannel(new DataChannel<byte>((short)ChannelId.ByteUnRel, QosType.Unreliable, comp, (node, data) =>
+            terminal.AddChannel(new DataChannel<byte>((short)ChannelId.ByteUnRel, QosType.Unreliable, comp, enc, (node, data) =>
             {
                 if (data == byteData) byteCheck = true;
             }, checkMode));
 
             //Short
-            terminal.AddChannel(new DataChannel<short>((short)ChannelId.ShortUnRel, QosType.Unreliable, comp, (node, data) =>
+            terminal.AddChannel(new DataChannel<short>((short)ChannelId.ShortUnRel, QosType.Unreliable, comp, enc, (node, data) =>
             {
                 if (data == shortData) shortCheck = true;
             }, checkMode));
 
             //Int
-            terminal.AddChannel(new DataChannel<int>((short)ChannelId.IntUnRel, QosType.Unreliable, comp, (node, data) =>
+            terminal.AddChannel(new DataChannel<int>((short)ChannelId.IntUnRel, QosType.Unreliable, comp, enc, (node, data) =>
             {
                 if (data == intData) intCheck = true;
             }, checkMode));
 
             //Float
-            terminal.AddChannel(new DataChannel<float>((short)ChannelId.FloatUnRel, QosType.Unreliable, comp, (node, data) =>
+            terminal.AddChannel(new DataChannel<float>((short)ChannelId.FloatUnRel, QosType.Unreliable, comp, enc, (node, data) =>
             {
                 if (data == floatData) floatCheck = true;
             }, checkMode));
 
             //Double
-            terminal.AddChannel(new DataChannel<double>((short)ChannelId.DoubleUnRel, QosType.Unreliable, comp, (node, data) =>
+            terminal.AddChannel(new DataChannel<double>((short)ChannelId.DoubleUnRel, QosType.Unreliable, comp, enc, (node, data) =>
             {
                 if (data == doubleData) doubleCheck = true;
             }, checkMode));
 
             //String
-            terminal.AddChannel(new DataChannel<string>((short)ChannelId.StringUnRel, QosType.Unreliable, comp, (node, data) =>
+            terminal.AddChannel(new DataChannel<string>((short)ChannelId.StringUnRel, QosType.Unreliable, comp, enc, (node, data) =>
             {
                 if (data == stringData) stringCheck = true;
             }, checkMode));
 
             //Class
-            terminal.AddChannel(new DataChannel<TestClass>((short)ChannelId.ClassUnRel, QosType.Unreliable, comp, (node, data) =>
+            terminal.AddChannel(new DataChannel<TestClass>((short)ChannelId.ClassUnRel, QosType.Unreliable, comp, enc, (node, data) =>
             {
                 if (
                     data.intData == testData.intData
@@ -137,7 +136,7 @@ namespace Snowball.Tests
 
             terminal.Open();
 
-            IPEndPoint endPoint = new IPEndPoint(IPAddress.Loopback, terminal.SendPortNumber);
+            IPEndPoint endPoint = new IPEndPoint(IPAddress.Loopback, terminal.PortNumber);
             ComNode lnode = new ComNode(endPoint);
 
             //Send
@@ -189,8 +188,8 @@ namespace Snowball.Tests
             Util.Log("StressTest");
 
             ComTerminal terminal = new ComTerminal();
-            terminal.ListenPortNumber = this.server.SendPort;
-            terminal.SendPortNumber = this.server.ListenPort;
+            terminal.ListenPortNumber = this.server.Port;
+            terminal.PortNumber = this.server.Port + 1;
 
             terminal.AddAcceptList(IPAddress.Loopback.ToString());
 
@@ -207,7 +206,7 @@ namespace Snowball.Tests
 
             //Byte
             //Class
-            terminal.AddChannel(new DataChannel<TestClass>((short)ChannelId.ClassUnRel, QosType.Unreliable, comp, (node, data) =>
+            terminal.AddChannel(new DataChannel<TestClass>((short)ChannelId.ClassUnRel, QosType.Unreliable, comp, enc, (node, data) =>
             {
                 if (
                     data.intData == testData.intData
@@ -226,7 +225,7 @@ namespace Snowball.Tests
 
             Util.Log("sendTestNum:" + sendTestNum);
 
-            IPEndPoint endPoint = new IPEndPoint(IPAddress.Loopback, terminal.SendPortNumber);
+            IPEndPoint endPoint = new IPEndPoint(IPAddress.Loopback, terminal.PortNumber);
             ComNode lnode = new ComNode(endPoint);
 
             //Send
